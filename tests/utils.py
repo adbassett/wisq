@@ -1,8 +1,8 @@
 import numpy as np
-from qiskit import QuantumCircuit, transpile
+from qiskit import QuantumCircuit
 from qiskit.quantum_info import Statevector, Operator
 
-def remove_measurements(circuit: QuantumCircuit):
+def assert_no_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
         """
         helper: remove measurements from quantum circuit
 
@@ -10,16 +10,17 @@ def remove_measurements(circuit: QuantumCircuit):
             circuit: QuantumCircuit
                 the input quantum circuit
         returns:
-            QuantumCircuit: the circuit without the measurements
+            QuantumCircuit: the same circuit as passed in
+        throws:
+            ValueError: if the input circuit contains measurements
         """
-        new_circ = QuantumCircuit(*circuit.qregs)
         for instruction in circuit.data:
-            if instruction.operation.name != "measure":
-                new_circ.append(instruction.operation, instruction.qubits, instruction.clbits)
-        return new_circ
+            if instruction.operation.name == "measure":
+                raise ValueError("circuit contains measurements")
+        return circuit
 
 
-def circuits_equal_exact(qasm1: QuantumCircuit, qasm2: QuantumCircuit):
+def is_circuit_equiv(qasm1: QuantumCircuit, qasm2: QuantumCircuit):
     """
     compare two quantum circuits to check if they are equal to each other,
     up to some global phase
@@ -36,18 +37,21 @@ def circuits_equal_exact(qasm1: QuantumCircuit, qasm2: QuantumCircuit):
             the input quantum circuits to check
     returns:
         bool: True if equal, False ow
+    throws:
+        ValueError: if either of the input circuits contain measurements
     """
+    assert_no_measurements(qasm1)
+    assert_no_measurements(qasm2)
+
     if qasm1.num_qubits != qasm2.num_qubits:
         return False
-    c1 = transpile(remove_measurements(qasm1), basis_gates=['u3', 'cx'])
-    c2 = transpile(remove_measurements(qasm2), basis_gates=['u3', 'cx'])
 
-    op1 = Operator(c1)
-    op2 = Operator(c2)
+    op1 = Operator(qasm1)
+    op2 = Operator(qasm2)
     return op1.equiv(op2)
 
 
-def circuits_equal_quick(qasm1: QuantumCircuit, qasm2: QuantumCircuit, tol: float = 1e-8, trials: int = 5) -> bool:
+def is_circuit_equiv_random_sv(qasm1: QuantumCircuit, qasm2: QuantumCircuit, tol: float = 1e-8, trials: int = 5) -> bool:
     """
     compare two quantum circuits to check if they are equal to each other,
     up to some global phase
@@ -76,42 +80,24 @@ def circuits_equal_quick(qasm1: QuantumCircuit, qasm2: QuantumCircuit, tol: floa
             the number of test circuits to pump through
     returns:
         bool: True if equal within tolerance, False ow
+    throws:
+        ValueError: if either of the input circuits contain measurements
     """
+    assert_no_measurements(qasm1)
+    assert_no_measurements(qasm2)
 
     if qasm1.num_qubits != qasm2.num_qubits:
         return False
     n = qasm1.num_qubits
-    c1 = transpile(remove_measurements(qasm1), basis_gates=['u3', 'cx'])
-    c2 = transpile(remove_measurements(qasm2), basis_gates=['u3', 'cx'])
     for _ in range(trials):
         psi = np.random.randn(2**n) + 1j * np.random.randn(2**n)
         psi /= np.linalg.norm(psi)
         sv = Statevector(psi)
-        out1 = sv.evolve(c1)
-        out2 = sv.evolve(c2)
+        out1 = sv.evolve(qasm1)
+        out2 = sv.evolve(qasm2)
         # check for global phase
         inner = np.vdot(out1.data, out2.data)
         if abs(abs(inner) - 1.0) > tol:
             return False
     
     return True
-
-
-def circuits_equal(qasm1: QuantumCircuit, qasm2: QuantumCircuit):
-    """
-    checks if two given quantum circuits are equal
-
-    for |qubits| <= 8, an exact equivalence check is used, while
-    for |qubits| > 8, a much quicker, probabilistic check is used
-
-    args:
-        qasm1, qasm2: QuantumCircuit
-            the two quantum circuits
-    returns:
-        bool: True if equal, False ow
-    """
-    n = qasm1.num_qubits
-    if n <= 8:
-        return circuits_equal_exact(qasm1, qasm2)
-    else:
-        return circuits_equal_quick(qasm1, qasm2)
