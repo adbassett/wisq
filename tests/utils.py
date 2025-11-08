@@ -4,7 +4,7 @@ from qiskit.quantum_info import Statevector, Operator
 
 def assert_no_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
         """
-        helper: remove measurements from quantum circuit
+        helper: checks for measurements in quantum circuit
 
         args:
             circuit: QuantumCircuit
