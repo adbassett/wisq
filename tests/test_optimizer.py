@@ -52,11 +52,6 @@ def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: 
   output_path = Path("out.qasm")
 
   try:
-    # clean up from prior runs
-    for path in [input_path, output_path]:
-      if path.exists():
-        path.unlink()
-
     build_random_qasm(num_qubits=num_qubits, depth=depth, seed=seed, basis_gates=gateset, dir_name=".", file_name="input")
 
     # sanity check
