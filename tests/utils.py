@@ -4,7 +4,9 @@ from qiskit.quantum_info import Statevector, Operator
 import os
 import time
 from qiskit.circuit.random import random_circuit
-from qiskit.qasm2 import dumps as dump_qasm_2
+from qiskit.qasm2 import dump as dump_qasm_2
+from qiskit import transpile
+from pathlib import Path
 
 def assert_no_measurements(circuit: QuantumCircuit) -> QuantumCircuit:
         """
@@ -110,6 +112,7 @@ def is_circuit_equiv_random_sv(qasm1: QuantumCircuit, qasm2: QuantumCircuit, tol
 def build_random_qasm(
         num_qubits: int,
         depth: int,
+        basis_gates: list[str] | None = None,
         dir_name: str = "randomly-generated-circuits",
         file_name: str | None = None
     ) -> None:
@@ -123,6 +126,10 @@ def build_random_qasm(
             the number of qubits
         depth: int
             the depth of the generated circuit
+        basis_gates: list[str] | None = None
+            the list of gates to be included in the circuit
+            if left as None, the gates will be selected from
+            qiskit.circuit.library.standard_gates
         dir_name: str = "randomly-generated-circuits"
             the name of the directory to store the randomly generated circuits
         file_name: str | None
@@ -138,10 +145,9 @@ def build_random_qasm(
         num_qubits=num_qubits,
         depth=depth,
     )
+    circ = transpile(circ, basis_gates=basis_gates, optimization_level=0)
     os.makedirs(dir_name, exist_ok=True)
-    circ_str = dump_qasm_2(circ)
     if file_name == None:
         file_name = f"random_{num_qubits}q_{depth}d-{int(time.time())}"
-    filename = f"{dir_name}/{file_name}.qasm"
-    with open(filename, "w") as f:
-        f.write(circ_str)
+    output_path = Path(dir_name) / f"{file_name}.qasm"
+    dump_qasm_2(circ, output_path)
