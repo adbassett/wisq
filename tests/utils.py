@@ -9,7 +9,7 @@ from pathlib import Path
 def build_random_qasm(
         num_qubits: int,
         depth: int,
-        gate_set: list[str] | None = None,
+        basis_gates: list[str] | None = None,
         dir_name: str = "randomly-generated-circuits",
         file_name: str | None = None
     ) -> None:
@@ -23,7 +23,7 @@ def build_random_qasm(
             the number of qubits
         depth: int
             the depth of the generated circuit
-        gate_set: list[str] | None = None
+        basis_gates: list[str] | None = None
             the list of gates to be included in the circuit
             if left as None, the gates will be selected from
             qiskit.circuit.library.standard_gates
@@ -42,6 +42,7 @@ def build_random_qasm(
         num_qubits=num_qubits,
         depth=depth,
     )
+    circ = transpile(circ, basis_gates=basis_gates, optimization_level=0)
     os.makedirs(dir_name, exist_ok=True)
     if file_name == None:
         file_name = f"random_{num_qubits}q_{depth}d-{int(time.time())}"
