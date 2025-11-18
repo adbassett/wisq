@@ -128,6 +128,7 @@ def run_guoq(
     args=None,
     verbose=False,
     path_to_synthetiq=None,
+    serverless=False,
 ):
     # Create temporary scratch directory for GUOQ
     scratch_dir_path, uid = create_scratch_dir(output_path)
@@ -163,7 +164,7 @@ def run_guoq(
 
         # Start resynthesis server if needed
         resynth_proc = None
-        if args.get("-resynth", None) != "NONE":
+        if args.get("-resynth", None) != "NONE" and not serverless:
             if optimization_objective in ["FT", "T"] and path_to_synthetiq is None:
                 system = platform.system().lower()
                 processor = platform.processor().lower()
@@ -198,7 +199,7 @@ def run_guoq(
             proc.terminate()
 
         # Kill resynthesis server
-        if resynth_proc is not None:
+        if resynth_proc is not None and not serverless:
             resynth_proc.terminate()
             resynth_proc.join()
     finally:

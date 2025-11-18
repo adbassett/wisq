@@ -95,6 +95,7 @@ def optimize(
     advanced_args: dict = None,
     verbose: bool = False,
     path_to_synthetiq: str = None,
+    serverless: bool = False,
 ) -> None:
     """
     Use the default GUOQ parameters to optimize a circuit. Recommended for most users. Advanced users can use `advanced_args` to override default values.
@@ -119,7 +120,318 @@ def optimize(
         args=advanced_args,
         verbose=verbose,
         path_to_synthetiq=path_to_synthetiq,
+        serverless=serverless,
     )
+
+
+def parse_qasm_file(path: str) -> tuple[list[str], list[str]]:
+    """
+    helper: get header lines and a list of gate lines
+    args:
+        path: str
+            the path of the qasm file
+    returns:
+        header, gates: tuple[list[str], list[str]]
+            a tuple containing the header and the gates of the file
+    """
+    header = []
+    gates = []
+    in_header = True
+    with open(path, "r") as f:
+        for line in f:
+            l = line.strip()
+            if in_header:
+                header.append(line)
+                if l.startswith("qreg") or l.startswith("creg"):
+                    in_header = False
+            else:
+                if l:
+                    if l.startswith("qreg") or l.startswith("creg"):
+                        header.append(line)
+                    else:
+                        gates.append(line)
+    return header, gates
+
+
+def write_qasm_file(path: str, header: list[str], gate_lines: list[str]) -> None:
+    """
+    helper: creates a qasm file from a list of header lines and gate lines
+    args:
+        path: str
+            the path to write the output file to
+        header: list[str]
+            a list of header lines
+        gate_lines: list[str]
+            a list of actual quantum gates
+    returns:
+        none
+            writes file to path given
+    """
+    with open(path, "w") as f:
+        for h in header:
+            f.write(h)
+        for g in gate_lines:
+            f.write(g)
+
+
+def split_qasm(qasm_path: str, num_parts: int):
+    """
+    helper: split the header and gates within a qasm file
+    args:
+        qasm_path: str
+            the path of the qasm file to be parsed
+        num_parts: int
+            the number of parts to split the qasm circuit into
+    returns:
+        header, parts: tuple[list[str], list[list[str]]]
+            header: the header present for the qasm file
+            parts: a list of parts, each part being a list of qasm lines
+
+    """
+    header, gates = parse_qasm_file(qasm_path)
+    total = len(gates)
+    part_size = max(1, total // num_parts)
+    parts = []
+    for i in range(num_parts):
+        start = i * part_size
+        end = (i+1) * part_size if i < num_parts - 1 else total
+        parts.append(gates[start:end])
+
+    return header, parts
+
+
+from collections import defaultdict, deque
+class ParseGate:
+    """
+    helper: class to keep track of the name of the gate and the qubits
+    attached to it
+    """
+    def __init__(self, name: str, qubits: tuple[int, ...], raw: str):
+        self.name = name
+        self.qubits = tuple(qubits)
+        self.raw = raw
+
+def build_dependency_graph(gates: list[ParseGate]):
+    """
+    helper: builds a DAG for each of the gates and the qubits,
+    representing the dependencies of each
+    """
+    n = len(gates)
+    deps_count = [0] * n
+    adj = defaultdict(list)
+    last_gate = {}
+    for i, g in enumerate(gates):
+        touched_gates = set()
+        for q in g.qubits:
+            if q in last_gate:
+                touched_gates.add(last_gate[q])
+            last_gate[q] = i
+
+        # add dependencies
+        for prev in touched_gates:
+            adj[prev].append(i)
+            deps_count[i] += 1
+
+    return adj, deps_count
+
+
+def reorder_qasm(gates):
+    """
+    re-orders the circuit so that every gate is scheduled as soon as possible
+    """
+    adj, deps_count = build_dependency_graph(gates)
+    ready = deque([i for i, d in enumerate(deps_count) if d == 0])
+    order = []
+    while ready:
+        i = ready.popleft()
+        order.append(gates[i])
+        for nxt in adj[i]:
+            deps_count[nxt] -= 1
+            if deps_count[nxt] == 0:
+                ready.append(nxt)
+
+    return order
+
+
+def reorder_qasm_file(input_path: str, output_path: str):
+    import re
+    gate_pat = re.compile(r"""^
+        \s*
+        ([A-Za-z]\w*(?:\([^\)]*\))?)   # gate name optionally followed by (params)
+        \s+
+        (.*)                           # rest: qubit list and possibly more
+        ;
+        \s*$
+        """, re.VERBOSE
+    )
+    qubit_pat = re.compile(r"[A-Za-z]\w*\[(\d+)\]")
+
+    with open(input_path, "r") as f:
+        lines = f.readlines()
+
+    header_lines = []
+    gate_lines = []
+
+    for line in lines:
+        l = line.strip()
+        if l == "" or l.startswith("//"):
+            header_lines.append(line)
+            continue
+        m = gate_pat.match(line)
+        if m:
+            gate_lines.append(line.rstrip("\n"))
+        else:
+            header_lines.append(line)
+
+    def parse_gate(text):
+        m = gate_pat.match(text)
+        if not m:
+            raise ValueError(f"not a gate text: {text!r}")
+        gate_token = m.group(1)
+        rest = m.group(2)
+        qubits = [int(x) for x in qubit_pat.findall(rest)]
+        return ParseGate(gate_token, tuple(qubits), text)
+
+    gates = [parse_gate(t) for t in gate_lines]
+    reordered = reorder_qasm(gates)
+    with open(output_path, "w") as f:
+        for h in header_lines:
+            f.write(h)
+        for g in reordered:
+            if g.raw.strip().endswith(";"):
+                f.write(g.raw.strip() + "\n")
+            else:
+                qubit_str = ",".join(f"q[{q}]" for q in g.qubits)
+                f.write(f"{g.name} {qubit_str};\n")
+
+
+def optimize_parallel(
+    input_path: str,
+    num_threads: int,
+    output_path: str,
+    target_gateset: str,
+    optimization_objective: str,
+    timeout: int,
+    approximation_epsilon: float = 0,
+    advanced_args: dict | None = None,
+    verbose: bool = False,
+    path_to_synthetiq: str | None = None
+        ) -> str:
+    """
+    parallel wrapper for optimizer
+
+    args:
+        circuit: str
+            the input path of the circuit
+        num_threads: int
+            the number of threads to divide the optimizer between
+    returns:
+        none: writes the output file
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from pathlib import Path
+    import platform, sys, tempfile
+    from .guoq import start_resynth_server, is_server_ready
+
+    # start up the server, if needed
+    # Start resynthesis server if needed
+    resynth_proc = None
+    if not advanced_args or advanced_args.get("-resynth", None) != "NONE":
+        if optimization_objective in ["FT", "T"] and path_to_synthetiq is None:
+            system = platform.system().lower()
+            processor = platform.processor().lower()
+            print(system, processor)
+            if system == "linux" and processor in ["x86_64"]:
+                path_to_synthetiq = f"./bin/main_linux_{processor}"
+            elif system == "darwin" and processor in ["arm", "i386"]:
+                path_to_synthetiq = f"./bin/main_mac_{processor}"
+            else:
+                print(
+                    "Unsupported platform for pre-compiled Synthetiq. Please follow the instructions here to compile Synthetiq for your platform: https://github.com/eth-sri/synthetiq/tree/bbe3c1299a97295f5af38eec647f6bbe9fdd9234. Then try again using the `--abs_path_to_synthetiq/-apts` option to pass in the absolute path to the Synthetiq `bin/main` binary."
+                )
+                sys.exit(1)
+        resynth_proc = start_resynth_server(
+            bqskit=(advanced_args is not None and "BQSKIT" in advanced_args.values())
+            or optimization_objective in ["TWO_Q", "FIDELITY"],
+            verbose=verbose,
+            path_to_synthetiq=path_to_synthetiq,
+        )
+        # Wait for server to spin up
+        while not is_server_ready():
+            continue
+
+    # split the file
+    header, parts = split_qasm(input_path, num_threads)
+    temp_dir = Path(tempfile.mkdtemp(prefix="parallel_opt"))
+    part_paths = []
+    for i, part in enumerate(parts):
+        p = temp_dir / f"part_{i}.qasm"
+        write_qasm_file(str(p), header, part)
+        part_paths.append(p)
+
+    # define worker threads
+    def worker(qasm_path):
+        thread_temp_dir = Path(tempfile.mkdtemp(prefix="parallel_opt_part_"))
+        output_part = thread_temp_dir / f"{qasm_path.stem}_out.qasm"
+        optimize(
+            input_path=str(qasm_path),
+            output_path=str(output_part),
+            target_gateset=target_gateset,
+            optimization_objective=optimization_objective,
+            timeout=timeout,
+            approximation_epsilon=approximation_epsilon,
+            advanced_args=advanced_args,  # type:ignore
+            verbose=verbose,
+            path_to_synthetiq=path_to_synthetiq,  # type:ignore
+            serverless=True,
+        )
+        return output_part
+
+    retries = 10
+    remaining = list(part_paths)
+    optimized_part_paths = []
+
+    # we will retry for paths that don't exist after each thread
+    if verbose:
+        print(f"optimization for {len(remaining)} parts...")
+    failed = []
+    with ThreadPoolExecutor(max_workers=num_threads) as pool:
+        futures = {pool.submit(worker, p): p for p in remaining}
+        for f in as_completed(futures):
+            part = futures[f]
+            out_path = f.result()
+            # check if the output file exists
+            if out_path.exists():
+                optimized_part_paths.append(out_path)
+            else:
+                if verbose:
+                    print(f"output missing for {part}")
+                failed.append(part)
+    remaining = failed
+
+    if remaining:
+        raise RuntimeError(f"failed to optimize {len(remaining)} parts after {retries} attempts")
+
+    # sort through the order
+    optimized_gate_lists = [
+        parse_qasm_file(p)[1] for p in sorted(
+            optimized_part_paths,
+            key=lambda path: int(path.stem.split("_")[-2])
+            )
+    ]
+
+    # Kill resynthesis server if necessary
+    if resynth_proc is not None:
+        resynth_proc.terminate()
+        resynth_proc.join()
+
+    final_gates = [g for part in optimized_gate_lists for g in part]
+    write_qasm_file(output_path, header, final_gates)
+
+    if verbose:
+        print(f"parallel optimization complete -> {output_path}")
+
+    return output_path
 
 
 def compile_fault_tolerant(
