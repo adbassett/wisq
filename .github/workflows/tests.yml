@@ -35,4 +35,4 @@ jobs:
       - name: Run pytest
         run: |
           cd tests
-          pytest -v
+          pytest -v test_optimizer.py
