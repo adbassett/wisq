@@ -1,20 +1,30 @@
 import pytest
 import subprocess
 import shutil
-from utils import build_random_qasm, is_circuit_equiv_random_sv
+from utils import build_random_qasm, is_circuit_equiv
 from qiskit.qasm2 import load as load_qasm_2, LEGACY_CUSTOM_INSTRUCTIONS
 from pathlib import Path
 import time
 import random
+from wisq.guoq import GATE_SETS
+import csv
 
-@pytest.mark.parametrize("num_qubits,depth", [
-  (2, 5),
-  (3, 7),
-  (4, 10),
-  (5, 15),
-  (6, 22)
-])
-def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: str | None = None):
+def load_csv_args(path="args_limited.csv"):
+  rows = []
+  with open(path, newline="") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+      rows.append(row)
+  return rows
+
+
+def optimizer_cli_equivalence_test(
+  num_qubits: int = 4,
+  depth: int = 10,
+  quick: bool = False,
+  target_gateset: str | None = None,
+  csv_row: dict | None = None
+):
   """
   tests the optimizer by generating a random circuit, running it
   through the optimizer, then checking equivalence
@@ -23,25 +33,12 @@ def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: 
   the target_gateset param
   """
 
-  GATE_SETS = {
-    "NAM": ["rz", "h", "x", "cx"],
-    "CLIFFORDT": ["t", "tdg", "s", "sdg", "h", "x", "cx"],
-    "IBMO": ["u1", "u2", "u3", "cx"],
-    "IBMN": ["rz", "sx", "x", "cx"],
-    "ION": ["rx", "ry", "rz", "rxx"],
-  }
-
   seed = int(time.time())
   random.seed(seed)
   print(f"[INFO] Running with seed={seed}")
   
   if target_gateset:
     key = target_gateset.upper()
-    if key not in GATE_SETS:
-      raise ValueError(
-        f"invalid target gateset {target_gateset}."
-        f"valid options are: {','.join(GATE_SETS.keys())}"
-      )
     gateset_name = key
     gateset = GATE_SETS[key]
   else:
@@ -57,11 +54,32 @@ def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: 
     # sanity check
     assert input_path.exists(), "failed to generate QASM file"
 
+    # build args list
+    args = []
+    if csv_row is not None:
+      a = {k: (v if v != "" else None) for k, v in csv_row.items()}
+      args = ["wisq"]
+      args += ["--mode", "opt"]  # for now, only output .qasm
+      args += ["--target_gateset", a["target_gateset"]]
+      args += ["--optimization_objective", a["optimization_objective"]]
+      args += ["--opt_timeout", "10" if quick else a["opt_timeout"]]
+      args += ["--approx_epsilon", a["approx_epsilon"]]
+      args += ["--architecture", a["architecture"]]
+      if a["advanced_args"]:  
+          args += ["--advanced_args", a["advanced_args"]]
+      if a["verbose"] and a["verbose"].lower() == "true":
+          args.append("--verbose")
+      if a["guoq_help"] and a["guoq_help"].lower() == "true":
+          args.append("--guoq_help")
+      args.append(input_path.as_posix())
+    else:
+      args = [
+        "wisq", "--mode", "opt", "-ot", "10" if quick else "60", "-ap", "0.5",
+         "--target_gateset", gateset, input_path.as_posix()
+      ]
+    
     result = subprocess.run(
-      [
-        "wisq", "--mode", "opt", "-ot", "10", "-ap", "0.5",
-         "--target_gateset", "NAM", input_path.as_posix()
-      ],
+      args,
       capture_output=True,
       text=True
     )
@@ -82,7 +100,7 @@ def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: 
     circ_in = load_qasm_2(input_path.as_posix(), custom_instructions=LEGACY_CUSTOM_INSTRUCTIONS)
     circ_out = load_qasm_2(output_path.as_posix(), custom_instructions=LEGACY_CUSTOM_INSTRUCTIONS)
 
-    if not is_circuit_equiv_random_sv(circ_in, circ_out):
+    if not is_circuit_equiv(circ_in, circ_out):
       fail_dir = Path("failed_tests")
       fail_dir.mkdir(exist_ok=True)
       name_header = f"{gateset_name}_{num_qubits}q_{depth}d_{seed}s"
@@ -97,3 +115,21 @@ def test_optimizer_cli_equivalence(num_qubits: int, depth: int, target_gateset: 
     for path in [input_path, output_path]:
       if path.exists():
         path.unlink()
+
+@pytest.mark.parametrize(
+  "csv_row",
+  load_csv_args()  
+)
+def test_optimizer_cli_equivalence_csv(csv_row):
+  """
+  tests the optimizer using arguments from args_limited.csv
+  uses fixed num_qubits & depth (for now)
+  """
+  print(csv_row)
+  optimizer_cli_equivalence_test(
+    num_qubits=4,
+    depth=10,
+    quick=False,
+    target_gateset=csv_row["target_gateset"],
+    csv_row=csv_row
+  )
