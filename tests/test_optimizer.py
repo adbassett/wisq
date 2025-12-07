@@ -9,6 +9,7 @@ import random
 from wisq.guoq import GATE_SETS
 import csv
 
+
 def load_csv_args(path="args_limited.csv"):
   rows = []
   with open(path, newline="") as f:
@@ -19,11 +20,7 @@ def load_csv_args(path="args_limited.csv"):
 
 
 def optimizer_cli_equivalence_test(
-  num_qubits: int = 4,
-  depth: int = 10,
-  quick: bool = False,
-  target_gateset: str | None = None,
-  csv_row: dict | None = None
+  args_dict: dict[str, str]
 ):
   """
   tests the optimizer by generating a random circuit, running it
@@ -32,18 +29,15 @@ def optimizer_cli_equivalence_test(
   this is done with a random gateset as well, unless specified through
   the target_gateset param
   """
+  num_qubits: int = 4
+  depth: int = 10
 
   seed = int(time.time())
   random.seed(seed)
   print(f"[INFO] Running with seed={seed}")
   
-  if target_gateset:
-    key = target_gateset.upper()
-    gateset_name = key
-    gateset = GATE_SETS[key]
-  else:
-    gateset_name = random.choice(list(GATE_SETS.keys()))
-    gateset = GATE_SETS[gateset_name]
+  gateset_name = args_dict["target_gateset"].upper() if args_dict["target_gateset"] else random.choice(list(GATE_SETS.keys()))
+  gateset = GATE_SETS[gateset_name]
 
   input_path = Path("input.qasm")
   output_path = Path("out.qasm")
@@ -55,28 +49,17 @@ def optimizer_cli_equivalence_test(
     assert input_path.exists(), "failed to generate QASM file"
 
     # build args list
-    args = []
-    if csv_row is not None:
-      a = {k: (v if v != "" else None) for k, v in csv_row.items()}
-      args = ["wisq"]
-      args += ["--mode", "opt"]  # for now, only output .qasm
-      args += ["--target_gateset", a["target_gateset"]]
-      args += ["--optimization_objective", a["optimization_objective"]]
-      args += ["--opt_timeout", "10" if quick else a["opt_timeout"]]
-      args += ["--approx_epsilon", a["approx_epsilon"]]
-      args += ["--architecture", a["architecture"]]
-      if a["advanced_args"]:  
-          args += ["--advanced_args", a["advanced_args"]]
-      if a["verbose"] and a["verbose"].lower() == "true":
-          args.append("--verbose")
-      if a["guoq_help"] and a["guoq_help"].lower() == "true":
-          args.append("--guoq_help")
-      args.append(input_path.as_posix())
-    else:
-      args = [
-        "wisq", "--mode", "opt", "-ot", "10" if quick else "60", "-ap", "0.5",
-         "--target_gateset", gateset, input_path.as_posix()
-      ]
+    args = ["wisq", "--mode", "opt", input_path.as_posix()]  # hardcoded params needed for testing
+    for arg, value in args_dict.items():
+      if arg == "mode":  # check for overwritten args
+        continue
+      elif value is None or value.lower() == "false" or value == "":  # check for blank args
+        continue
+      elif value.lower() == "true":  # check for flags
+        args += [f"--{arg}"]
+      else:
+        args += [f"--{arg}", value]
+
     
     result = subprocess.run(
       args,
@@ -116,6 +99,7 @@ def optimizer_cli_equivalence_test(
       if path.exists():
         path.unlink()
 
+
 @pytest.mark.parametrize(
   "csv_row",
   load_csv_args()  
@@ -127,9 +111,5 @@ def test_optimizer_cli_equivalence_csv(csv_row):
   """
   print(csv_row)
   optimizer_cli_equivalence_test(
-    num_qubits=4,
-    depth=10,
-    quick=False,
-    target_gateset=csv_row["target_gateset"],
-    csv_row=csv_row
+    args_dict=csv_row
   )
