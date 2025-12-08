@@ -124,456 +124,134 @@ def optimize(
     )
 
 
-def parse_qasm_file(path: str) -> tuple[list[str], list[str]]:
+from qiskit import QuantumCircuit, converters, qasm2, dagcircuit
+def _compose_evenly(qcs: list[QuantumCircuit], parts: int) -> list[QuantumCircuit]:
+    while len(qcs) > parts:
+        pair_costs = [
+            (len(qcs[i].data) + len(qcs[i+1].data), i)
+            for i in range(len(qcs) - 1)
+        ]
+        _, i = min(pair_costs, key=lambda x: x[0])  # pick cheapest adjacent pair
+        qcs[i].compose(qcs[i+1], inplace=True)
+        qcs.pop(i+1)
+    return qcs
+
+
+def naive_split(qasm_circuit: QuantumCircuit, parts: int) -> list[QuantumCircuit]:
     """
-    helper: get header lines and a list of gate lines
-    args:
-        path: str
-            the path of the qasm file
-    returns:
-        header, gates: tuple[list[str], list[str]]
-            a tuple containing the header and the gates of the file
+    splitting method: just split evenly into n parts
+
+    Args:
+        qasm_circuit (QuantumCircuit): the quantum circuit to split into n parts
+        parts (int): the number of parts to split the quantum circuit into
+
+    Returns:
+        list[QuantumCircuit]: list of generated subcircuits
     """
-    header = []
-    gates = []
-    in_header = True
-    with open(path, "r") as f:
-        for line in f:
-            l = line.strip()
-            if in_header:
-                header.append(line)
-                if l.startswith(("qreg", "creg")):
-                    in_header = False
-            else:
-                if l:
-                    if l.startswith("qreg") or l.startswith("creg"):
-                        header.append(line)
-                    else:
-                        gates.append(line)
-    return header, gates
+    instructions = qasm_circuit.data
+    total = len(instructions)
+    chunk_size = (total + parts - 1) // parts
+    # prepare subcircuits
+    subcircuits = [
+        QuantumCircuit(qasm_circuit.qubits, qasm_circuit.clbits) for _ in range(parts)
+    ]
+    # fill subcircuits
+    for i in range(parts):
+        start = i * chunk_size
+        end = start + chunk_size
+        for inst, qargs, cargs in instructions[start:end]:
+            subcircuits[i].append(inst, qargs, cargs)
+    return subcircuits
 
 
-def write_qasm_file(path: str, header: list[str], gate_lines: list[str]) -> None:
+def topo_split_by_qubit_connectivity(qasm_circuit: QuantumCircuit, max_parts: int) -> list[QuantumCircuit]:
     """
-    helper: creates a qasm file from a list of header lines and gate lines
-    args:
-        path: str
-            the path to write the output file to
-        header: list[str]
-            a list of header lines
-        gate_lines: list[str]
-            a list of actual quantum gates
-    returns:
-        none
-            writes file to path given
+    splitting method: splits into disconnected qubit sets, no shared qubits
+
+    Args:
+        qasm_circuit (QuantumCircuit): the quantum circuit to split into n parts
+        max_parts (int): the max number of parts to split the quantum circuit into
+
+    Returns:
+        list[QuantumCircuit]: list of generated subcircuits
     """
-    with open(path, "w") as f:
-        f.writelines(header)
-        f.writelines(gate_lines)
+    dag = converters.circuit_to_dag(qasm_circuit)
+    sub_dags = dag.separable_circuits()
+    qc_list = [converters.dag_to_circuit(d) for d in sub_dags]
+    return _compose_evenly(qc_list, max_parts)
 
 
-from collections import defaultdict, deque
-class ParseGate:
+def topo_split_by_layers(qasm_circuit: QuantumCircuit, max_parts: int) -> list[QuantumCircuit]:
     """
-    helper: class to keep track of the name of the gate and the qubits
-    attached to it
+    splitting method: splits into layers where gates act on disjoint qubits, returned by DAG.serial_layers
+
+    Args:
+        qasm_circuit (QuantumCircuit): the quantum circuit to split into n parts
+        max_parts (int): the max number of parts to split the quantum circuit into
+
+    Returns:
+        list[QuantumCircuit]: list of generated subcircuits
     """
-    def __init__(self, name: str, qubits: tuple[int, ...], raw: str):
-        self.name = name
-        self.qubits = tuple(qubits)
-        self.raw = raw
+    dag = converters.circuit_to_dag(qasm_circuit)
+    layer_dags = []
+    for layer in dag.layers():
+        new_dag = dagcircuit.DAGCircuit()
+        for qr in dag.qregs.values():
+            new_dag.add_qreg(qr)
+        for cr in dag.cregs.values():
+            new_dag.add_creg(cr)
+        for node in layer["graph"].op_nodes():
+            new_dag.apply_operation_back(node.op, node.qargs, node.cargs)
+        layer_dags.append(new_dag)
+    qc_list = [converters.dag_to_circuit(d) for d in layer_dags]
+    return _compose_evenly(qc_list, max_parts)
 
 
-import re
-GATE_PATTERN = re.compile(r"^\s*([A-Za-z]\w*(?:\([^\)]*\))?)\s+(.*?);\s*$")
-QUBIT_PATTERN = re.compile(r"[A-Za-z]\w*\[(\d+)\]")
-def parse_gate(text: str) -> ParseGate:
+def topo_split_by_depth(qasm_circuit: QuantumCircuit, max_parts: int) -> list[QuantumCircuit]:
     """
-    helper: partse a gate into a ParseGate object
+    splitting method: splits into subcircuits with max layers
+
+    Args:
+        qasm_circuit (QuantumCircuit): the quantum circuit to split into n parts
+        max_parts (int): the max number of parts to split the quantum circuit into
+
+    Returns:
+        list[QuantumCircuit]: list of generated subcircuits
     """
-    m = GATE_PATTERN.match(text)
-    if not m:
-        raise ValueError(f"invalid gate format: {text!r}")
-    gate_token = m.group(1)
-    rest = m.group(2)
-    qubits = tuple(int(x) for x in QUBIT_PATTERN.findall(rest))
-    return ParseGate(gate_token, qubits, text)
-
-SELF_INVERSE_GATES = {"x", "y", "z", "h", "s", "sdg", "t", "tdg", "sx"}
-INVERSE_PAIRS = {
-    "s": "sdg", "sdg": "s",
-    "t": "tdg", "tdg": "t",
-    "rx": "rx", "ry": "ry", "rz": "rz",
-}
-
-from collections import defaultdict
-def build_full_graph(gates: list[ParseGate]) -> tuple[dict[int, list[int]], dict[int, list[int]], list[int]]:
-    """
-    helper: builds graph with predecessor and successors
-    returns (succ_adj, pred_adj, indeg_list)
-    """
-    n = len(gates)
-    succ = defaultdict(list)
-    pred = defaultdict(list)
-    indeg = [0] * n
-    last_gate_by_qubit = {}
-    for i, g in enumerate(gates):
-        touched = set()
-        for q in g.qubits:
-            if q in last_gate_by_qubit:
-                prev = last_gate_by_qubit[q]
-                if i not in succ[prev]:
-                    succ[prev].append(i)
-                if prev not in pred[i]:
-                    pred[i].append(prev)
-                touched.add(prev)
-            last_gate_by_qubit[q] = i
-    for i in range(n):
-        indeg[i] = len(pred[i])
-    return succ, pred, indeg
+    import math
+    dag = converters.circuit_to_dag(qasm_circuit)
+    max_depth = math.ceil(dag.depth() / max_parts)
+    sub_dags = []
+    current = None
+    depth = 0
+    for layer in dag.layers():
+        if current is None:
+            current = dagcircuit.DAGCircuit()
+            # add same registers as qc
+            for qreg in qasm_circuit.qregs:
+                current.add_qreg(qreg)
+            for creg in qasm_circuit.cregs:
+                current.add_creg(creg)
+            depth = 0
+        # merge layer into current
+        for node in layer["graph"].op_nodes():
+            current.apply_operation_back(node.op, qargs=node.qargs, cargs=node.cargs)
+        depth += 1
+        if depth >= max_depth:
+            sub_dags.append(current)
+            current = None
+    # leftovers
+    if current is not None:
+        sub_dags.append(current)
+    qc_list = [converters.dag_to_circuit(d) for d in sub_dags]
+    return qc_list
 
 
-def find_asap_times(succ: dict[int, list[int]], pred: dict[int, list[int]], indeg: list[int]) -> list[int]:
-    n = len(indeg)
-    asap = [0] * n
-    q = deque([i for i, d in enumerate(indeg) if d == 0])
-    topo = []
-    local_indeq = indeg[:]
-    while q:
-        u = q.popleft()
-        topo.append(u)
-        for v in succ.get(u, []):
-            asap[v] = max(asap[v], asap[u] + 1)
-            local_indeq[v] -= 1
-            if local_indeq[v] == 0:
-                q.append(v)
-    return asap
 
-
-def find_alap_times(succ: dict[int, list[int]], pred: dict[int, list[int]], asap: list[int]) -> list[int]:
-    n = len(asap)
-    h = max(asap) + 1  # upper bound
-    alap = [h] * n
-    order = sorted(range(n), key=lambda i: asap[i], reverse=True)  # asap descending
-    for u in order:
-        if not succ.get(u):
-            alap[u] = asap[u]  # leaf
-        else:
-            alap[u] = min(alap[v] - 1 for v in succ[u])
-            alap[u] = max(alap[u], asap[u])
-    return alap
-
-import heapq
-def pack_schedule(gates: list[ParseGate]) -> list[ParseGate]:
-    """
-    return reorder gates after packing into time steps
-    """
-    succ, pred, indeg = build_full_graph(gates)
-    n = len(gates)
-    asap = find_asap_times(succ, pred, indeg)
-    alap = find_alap_times(succ, pred, asap)
-    slack = [alap[i] - asap[i] for i in range(n)]  # range of which we can place each gate
-    remaining_preds = [len(pred[i]) for i in range(n)]
-    scheduled = [False] * n
-    succ_map = succ
-    qubit_free_at = defaultdict(int)  # track when qubit becomes free
-    def priority_for(i):
-        # (slack, -num_successors, asap, gate_index)
-        return (slack[i], -len(succ_map.get(i, [])), asap[i], i)
-    ready_heap = []
-    # add gates with no more preds
-    for i in range(n):
-        if remaining_preds[i] == 0:
-            heapq.heappush(ready_heap, (priority_for(i), i))
-    time = 0
-    schedule_time = [None]*n
-    unscheduled_count = n
-    while unscheduled_count > 0:
-        any_scheduled = False
-        temp_list = []
-        while ready_heap:
-            pr, idx = heapq.heappop(ready_heap)
-            if all(qubit_free_at[q] <= time for q in gates[idx].qubits):
-                # time to schedule
-                schedule_time[idx] = time
-                scheduled[idx] = True
-                any_scheduled = True
-                unscheduled_count -= 1
-                # mark as busy
-                for q in gates[idx].qubits:
-                    qubit_free_at[q] = time + 1
-                # push successors whose preds are now satisfied
-                for v in succ_map.get(idx, []):
-                    remaining_preds[v] -= 1
-                    if remaining_preds[v] == 0:
-                        heapq.heappush(ready_heap, (priority_for(v)), v)
-            else:
-                # cannot schedule
-                temp_list.append((pr, idx))
-        # re-add leftovers
-        for item in temp_list:
-            heapq.heappush(ready_heap, item)
-        
-        if not any_scheduled:
-            # jump to next free qubit
-            next_free_qubit = min(qubit_free_at.values()) if qubit_free_at else time+1
-            next_ready_asap = None
-            if ready_heap:
-                # check earliest asap
-                next_ready_asap = min(asap[idx] for _, idx in ready_heap)
-            candidates = [t for t in (next_free_qubit, next_ready_asap) if t is not None and t > time]
-            if candidates:
-                time = min(candidates)
-            else:
-                # fallback
-                time += 1
-        else:
-            # TODO: is advance by 1 fallback necessary?
-            time += 1
-    ordered = sorted(range(n), key=lambda i: (schedule_time[i], asap[i], i))
-    return[gates[i] for i in ordered]
-
-
-def minimize_qubit_lifetime(gates: list[ParseGate]) -> list[ParseGate]:
-    return pack_schedule(gates)
-
-
-def get_gate_qubits_used(gates: list[ParseGate]) -> set[int]:
-    """
-    helper: get all qubits used in gate sequence
-    """
-    qubits = set()
-    for gate in gates:
-        qubits.update(gate.qubits)
-    return qubits
-
-
-def peephole_optimzie(gates: list[ParseGate]) -> list[ParseGate]:
-    """
-    helper: apply local pattern matching to quickly cancel/merge consecutive gates
-    """
-    optimized = []
-    i = 0
-    while i < len(gates):
-        current = gates[i]
-        if i + 1 < len(gates):  # look ahead
-            next_gate = gates[i+1]
-            # check for overlap
-            if set(current.qubits) & set(next_gate.qubits):
-                current_base = current.name.split("(")[0]
-                next_base = current.name.split("(")[0]
-
-                # cancel self inverse gates
-                if (current.qubits == next_gate.qubits and
-                    current_base in SELF_INVERSE_GATES and
-                    current_base == next_base
-                    ):
-                    i += 2
-                    continue
-
-                # cancel inverse pairs
-                if (current.qubits == next_gate.qubits and
-                    INVERSE_PAIRS.get(current_base) == next_base):
-                    i += 2
-                    continue
-        optimized.append(current)
-        i += 1
-    return optimized
-
-
-def build_dependency_graph(gates: list[ParseGate]):
-    """
-    helper: builds a DAG for each of the gates and the qubits,
-    representing the dependencies of each
-    """
-    n = len(gates)
-    deps_count = [0] * n
-    adj = defaultdict(list)
-    last_gate = {}
-    for i, g in enumerate(gates):
-        touched_gates = set()
-        for q in g.qubits:
-            if q in last_gate:
-                touched_gates.add(last_gate[q])
-            last_gate[q] = i
-
-        # add dependencies
-        for prev in touched_gates:
-            adj[prev].append(i)
-            deps_count[i] += 1
-
-    return adj, deps_count
-
-
-def reorder_qasm(gates: list[ParseGate]) -> list[ParseGate]:
-    """
-    re-orders the circuit so that every gate is scheduled as soon as possible
-    """
-    adj, deps_count = build_dependency_graph(gates)
-    ready = deque([i for i, d in enumerate(deps_count) if d == 0])
-    order = []
-    while ready:
-        i = ready.popleft()
-        order.append(gates[i])
-        for nxt in adj[i]:
-            deps_count[nxt] -= 1
-            if deps_count[nxt] == 0:
-                ready.append(nxt)
-
-    return order
-
-
-def split_qasm_by_connectivity(
-        qasm_path: str,
-        num_parts: int,
-        max_qubits_per_partition: int = 3,
-) -> tuple[list[str], list[list[ParseGate]]]:
-    """
-    helper: splits qasm circuit into parts based on qubit connectivity
-    limits subcircuits to a max length of max_qubits_per_partition, mainly
-    for debugging and optimization purposes
-    """
-    header, gate_lines = parse_qasm_file(qasm_path)
-    gates = [parse_gate(line.strip()) for line in gate_lines]
-    partitions: list[list[ParseGate]] = []
-    current_partition: list[ParseGate] = []
-    current_qubits: set[int] = set()
-
-    for gate in gates:
-        gate_qubits = set(gate.qubits)
-        new_qubits = gate_qubits - current_qubits
-        # if we exceed max qubits, force a split
-        if (len(current_qubits) + len(new_qubits) > max_qubits_per_partition and
-            current_partition and
-            len(partitions) < num_parts - 1):
-            partitions.append(current_partition)
-            current_partition = []
-            current_qubits = set()
-        
-        current_partition.append(gate)
-        current_qubits.update(gate_qubits)
-    
-    if current_partition:
-        partitions.append(current_partition)
-    return header, partitions
-
-
-def split_qasm(qasm_path: str, num_parts: int):
-    """
-    helper: naieve split within a qasm file
-    args:
-        qasm_path: str
-            the path of the qasm file to be parsed
-        num_parts: int
-            the number of parts to split the qasm circuit into
-    returns:
-        header, parts: tuple[list[str], list[list[str]]]
-            header: the header present for the qasm file
-            parts: a list of parts, each part being a list of qasm lines
-
-    """
-    header, gates = parse_qasm_file(qasm_path)
-    total = len(gates)
-    part_size = max(1, total // num_parts)
-    parts = []
-    for i in range(num_parts):
-        start = i * part_size
-        end = (i+1) * part_size if i < num_parts - 1 else total
-        parts.append(gates[start:end])
-
-    return header, parts
-
-
-def extract_boundary_gates(
-        gates: list[ParseGate],
-        boundary_depth: int = 3,
-) -> tuple[list[ParseGate], list[ParseGate], list[ParseGate]]:
-    """
-    extract gates near partition boundaries for seperate optimization
-    returns (start_boundary, middle_boundary, end_boundary)
-    """
-    if len(gates) <= 2 * boundary_depth:
-        return [], gates, []
-    
-    start = gates[:boundary_depth]
-    end = gates[-boundary_depth:]
-    middle = gates[boundary_depth:-boundary_depth]
-    return start, middle, end
-
-
-def reorder_qasm_file(input_path: str, output_path: str):
-    with open(input_path, "r") as f:
-        lines = f.readlines()
-
-    header_lines = []
-    gate_lines = []
-
-    for line in lines:
-        l = line.strip()
-        if not l or l.startswith("//"):
-            header_lines.append(line)
-            continue
-        elif GATE_PATTERN.match(line):
-            gate_lines.append(line.rstrip("\n"))
-        else:
-            header_lines.append(line)
-
-    gates = [parse_gate(t) for t in gate_lines]
-    reordered = reorder_qasm(gates)
-
-    with open(output_path, "w") as f:
-        f.writelines(header_lines)
-        for g in reordered:
-            if g.raw.strip().endswith(";"):
-                f.write(g.raw.strip() + "\n")
-            else:
-                qubit_str = ",".join(f"q[{q}]" for q in g.qubits)
-                f.write(f"{g.name} {qubit_str};\n")
-
-
-def optimize_boundary_region(
-    header: list[str], 
-    gates: list[ParseGate],
-    target_gateset: str,
-    optimization_objective: str,
-    timeout: int,
-    approximation_epsilon: float = 0,
-    advanced_args: dict | None = None,
-    verbose: bool = False,
-    path_to_synthetiq: str | None = None
-) -> list[ParseGate]:
-    """
-    helper: optimize a specific region of gates, most most likely circuit boundaries
-    """
-    from pathlib import Path
-    import tempfile
-    
-    temp_dir = Path(tempfile.mkdtemp(prefix="boundary_opt_"))
-    temp_input = temp_dir / "boundary_input.qasm"
-    temp_output = temp_dir / "boundary_output.qasm"
-    
-    write_qasm_file(str(temp_input), header, [g.raw + "\n" for g in gates])
-    
-    optimize(
-        input_path=str(temp_input),
-        output_path=str(temp_output),
-        target_gateset=target_gateset,
-        optimization_objective=optimization_objective,
-        timeout=timeout,
-        approximation_epsilon=approximation_epsilon,
-        advanced_args=advanced_args,
-        verbose=verbose,
-        path_to_synthetiq=path_to_synthetiq,
-        serverless=True,
-    )
-    
-    _, optimized_gates = parse_qasm_file(str(temp_output))
-    return [parse_gate(g.strip()) for g in optimized_gates if g.strip()]
-
-
+from typing import Callable
 def optimize_parallel(
     input_path: str,
-    num_threads: int,
+    max_threads: int,
     output_path: str,
     target_gateset: str,
     optimization_objective: str,
@@ -582,9 +260,8 @@ def optimize_parallel(
     advanced_args: dict | None = None,
     verbose: bool = False,
     path_to_synthetiq: str | None = None,
-    boundary_optimization: bool = True,
-    peephole_passes: int = 2,
-        ) -> str:
+    split_method: Callable[[QuantumCircuit, int], list[QuantumCircuit]] = naive_split
+) -> None:
     """
     parallel wrapper for optimizer
 
@@ -601,13 +278,12 @@ def optimize_parallel(
     import platform, sys, tempfile
     from .guoq import start_resynth_server, is_server_ready
 
-    # start up the server, if needed
     # Start resynthesis server if needed
     resynth_proc = None
     if not advanced_args or advanced_args.get("-resynth", None) != "NONE":
         if optimization_objective in ["FT", "T"] and path_to_synthetiq is None:
             system = platform.system().lower()
-            processor = platform.processor().lower()
+            processor = platform.processor().lower() or platform.machine().lower()
             print(system, processor)
             if system == "linux" and processor in ["x86_64"]:
                 path_to_synthetiq = f"./bin/main_linux_{processor}"
@@ -629,16 +305,15 @@ def optimize_parallel(
             continue
     try:
         # split the file
-        # header, parts = split_qasm(input_path, num_threads)
-        header, parts = split_qasm_by_connectivity(input_path, num_threads)
+        circuit_full = qasm2.load(input_path)
+        circuits = split_method(circuit_full, max_threads)
+        num_threads = len(circuits)
         temp_dir = Path(tempfile.mkdtemp(prefix="parallel_opt"))
         part_paths = []
-
-        for i, part in enumerate(parts):
+        for i, part in enumerate(circuits):
             p = temp_dir / f"part_{i}.qasm"
-            write_qasm_file(str(p), header, part)
+            qasm2.dump(part, p)
             part_paths.append(p)
-
         # define worker threads
         def worker(qasm_path):
             thread_temp_dir = Path(tempfile.mkdtemp(prefix="parallel_opt_part_"))
@@ -656,10 +331,8 @@ def optimize_parallel(
                 serverless=True,
             )
             return output_part
-
         remaining = list(part_paths)
         optimized_part_paths = []
-
         # we will retry for paths that don't exist after each thread
         if verbose:
             print(f"optimization for {len(remaining)} parts...")
@@ -674,89 +347,28 @@ def optimize_parallel(
                     optimized_part_paths.append(out_path)
                 else:
                     failed.append(part)
-
         if failed:
-            raise RuntimeError(f"failed to optimize {len(remaining)} parts: {failed}")
-
-        # sort through the order
-        optimized_gate_lists = [
-            parse_qasm_file(p)[1] for p in sorted(
+            raise RuntimeError(f"failed to optimize {len(failed)} parts: {failed}")
+        # get the circuits themselves, in order
+        optimized_circuits_list = [
+            qasm2.load(p) for p in sorted(
                 optimized_part_paths,
                 key=lambda path: int(path.stem.split("_")[-2])
-                )
-        ]
-
-        # convert back to ParseGate objects
-        all_gates = [
-            parse_gate(g.strip())
-            for part in optimized_gate_lists
-            for g in part
-            if g.strip()
-        ]
-        
-        # apply peephole optimization multiple passes
-        if verbose:
-            print(f"Applying {peephole_passes} peephole optimization passes...")
-        for pass_num in range(peephole_passes):
-            before_count = len(all_gates)
-            all_gates = peephole_optimzie(all_gates)
-            if verbose:
-                gates_removed = before_count - len(all_gates)
-                if gates_removed > 0:
-                    print(f"  Pass {pass_num + 1}: Removed {gates_removed} gates")
-        
-        # apply boundary region optimization
-        if boundary_optimization and len(all_gates) > 4:
-            if verbose:
-                print("Optimizing circuit boundaries...")
-            
-            boundary_depth = min(3, len(all_gates) // 4)
-            start_gates, middle_gates, end_gates = extract_boundary_gates(
-                all_gates, boundary_depth
             )
-            
-            temp_dir_boundary = Path(tempfile.mkdtemp(prefix="boundary_opt_"))
-            
-            # optimize start boundary
-            if start_gates:
-                start_gates = optimize_boundary_region(
-                    header, start_gates, target_gateset,
-                    optimization_objective, timeout // 3,
-                    advanced_args, path_to_synthetiq
-                )
-            
-            # optimize end boundary
-            if end_gates:
-                end_gates = optimize_boundary_region(
-                    header, end_gates, target_gateset,
-                    optimization_objective, timeout // 3,
-                    advanced_args, path_to_synthetiq
-                )
-            
-            all_gates = start_gates + middle_gates + end_gates
-            
-            if verbose:
-                print("Boundary optimization complete")
-        
-        # final topological reordering for circuit depth
-        all_gates = reorder_qasm(all_gates)
-        
+        ]
+        # convert back to a single circuit
+        full_quantum_circ = optimized_circuits_list[0]
+        for circuit in optimized_circuits_list[1:]:
+            full_quantum_circ.compose(circuit, inplace=True)
         # write final output
-        final_gate_lines = [g.raw + "\n" if hasattr(g, 'raw') else str(g) + "\n" for g in all_gates]
-        write_qasm_file(output_path, header, final_gate_lines)
-        
+        qasm2.dump(full_quantum_circ, output_path)  # type:ignore
         if verbose:
             print(f"Parallel optimization complete -> {output_path}")
-            print(f"Final circuit has {len(all_gates)} gates")
-        
-        return output_path
     finally:
         # kill resynthesis server if necessary
         if resynth_proc is not None:
             resynth_proc.terminate()
             resynth_proc.join()
-
-    
 
 
 def compile_fault_tolerant(
