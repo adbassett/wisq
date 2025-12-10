@@ -113,6 +113,7 @@ def build_random_qasm(
         num_qubits: int,
         depth: int,
         basis_gates: list[str] | None = None,
+        seed: int | None = None,
         dir_name: str = "randomly-generated-circuits",
         file_name: str | None = None
     ) -> None:
@@ -130,6 +131,8 @@ def build_random_qasm(
             the list of gates to be included in the circuit
             if left as None, the gates will be selected from
             qiskit.circuit.library.standard_gates
+        seed: int | None = None
+            the seed to use for the random circuit
         dir_name: str = "randomly-generated-circuits"
             the name of the directory to store the randomly generated circuits
         file_name: str | None
@@ -144,6 +147,7 @@ def build_random_qasm(
     circ = random_circuit(
         num_qubits=num_qubits,
         depth=depth,
+        seed=seed
     )
     circ = transpile(circ, basis_gates=basis_gates, optimization_level=0)
     os.makedirs(dir_name, exist_ok=True)
