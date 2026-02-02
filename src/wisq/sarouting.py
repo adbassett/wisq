@@ -36,7 +36,10 @@ def route_gate(indexed_gate, grid_len, grid_height, msf_faces, mapping, to_remov
                 break
     if shortest_pair != None:
         s,t = shortest_pair 
-        path = list(rx.dijkstra_shortest_paths(device_graph, source=s, target = t)[t])
+        if s == t:
+            path = [s]
+        else:
+            path = list(rx.dijkstra_shortest_paths(device_graph, source=s, target = t)[t])
         if s not in path:
             path = [s]+path
         if t not in path:
