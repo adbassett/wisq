@@ -16,7 +16,7 @@ from qiskit.circuit.equivalence_library import StandardEquivalenceLibrary as sel
 from qiskit import qasm2
 from .utils import create_scratch_dir
 from .resynth import start_server
-from .pennylane_sk import PennylaneSK
+from .qualtran_rotation_synthesis import QualtranRS
 
 GUOQ_JAR = os.path.join(
     os.path.dirname(__file__), "lib", "GUOQ-1.0-jar-with-dependencies.jar"
@@ -94,10 +94,11 @@ def transpile_if_needed(
         )
         nam_circuit = pm.run(circuit)
         num_rz = nam_circuit.count_ops().get("rz", 0)
+        print(f"Decomposing to Clifford + T using Qualtran rotation synthesis. Estimated time: {10*num_rz} seconds.")
         approximation_per_angle = approximation_epsilon / (num_rz * ERROR_BUDGET)
         approximation = approximation_epsilon / ERROR_BUDGET
 
-        pm = PassManager([PennylaneSK(approximation_per_angle)])
+        pm = PassManager([QualtranRS(approximation_per_angle)])
 
         transpiled = pm.run(nam_circuit)
     else:
@@ -165,7 +166,7 @@ def run_guoq(
         if args.get("-resynth", None) != "NONE":
             if optimization_objective in ["FT", "T"] and path_to_synthetiq is None:
                 system = platform.system().lower()
-                processor = platform.processor().lower()
+                processor = platform.processor().lower() or platform.machine().lower()
                 if system == "linux" and processor in ["x86_64"]:
                     path_to_synthetiq = f"./bin/main_linux_{processor}"
                 elif system == "darwin" and processor in ["arm", "i386"]:

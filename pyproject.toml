@@ -13,7 +13,7 @@ wisq = "wisq:main"
 
 [project]
 name = "wisq"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
     "bqskit",
     "numpy",
@@ -21,14 +21,15 @@ dependencies = [
     "pyzx",
     "qiskit>=1.0",
     "rustworkx",
-    "pennylane"
+    "qualtran @ git+https://github.com/quantumlib/Qualtran.git@fa5a8ec",
+    "pytest"
 ]
 description = ""
 readme = "README.md"
 requires-python = ">=3.8"
 
 authors = [
-    { name = "Abtin Molavi", email = "amolavi@wisc.edu"},
+    { name = "Abtin Molavi, Amanda Xu", email = "amolavi@wisc.edu"}, # multiple authors not supported by pypi :(
     { name = "Amanda Xu", email = "axu44@wisc.edu"},
 ]
 keywords = [
@@ -52,3 +53,6 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
 ]
+
+[project.optional-dependencies]
+test = ["pytest"]
